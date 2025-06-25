@@ -1,10 +1,9 @@
-# --- Import basic modules first ---
 import sys
 import subprocess
 import importlib
 
 # --- Auto-install required packages ---
-required = ["selenium", "openpyxl", "requests", "bs4"]
+required = ["selenium", "openpyxl", "requests", "bs4", "geopy"]
 for package in required:
     try:
         importlib.import_module(package)
@@ -16,7 +15,7 @@ import os
 import time
 import re
 from urllib.parse import quote_plus
-import requests, datetime, math
+import requests, math
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -28,12 +27,16 @@ from openpyxl import load_workbook
 from openpyxl.utils import column_index_from_string
 from openpyxl.styles import Alignment, PatternFill
 from openpyxl.styles.borders import Border, Side
-from urllib.parse import quote_plus
 import json
 from copy import copy
 from openpyxl.utils import get_column_letter
 import logging
 from selenium.webdriver.remote.remote_connection import LOGGER
+from datetime import datetime, timedelta
+from geopy.distance import geodesic
+import csv
+from io import StringIO
+from datetime import datetime, date
 
 # Suppress Selenium logging
 LOGGER.setLevel(logging.WARNING)
@@ -54,16 +57,260 @@ _REDFIN_HEADERS = {
     "Sec-Fetch-Site": "same-origin",
     "Cache-Control": "no-cache"
 }
+
 # Create a session for persistent cookies
 session = requests.Session()
 session.headers.update(_REDFIN_HEADERS)
 
 
-def get_redfin_comps(address: str,
-                     radius_miles: float = 1,
-                     sold_within_days: int = 365,
-                     max_rows: int = 200) -> list[dict]:
-    """Pull Redfin sold homes using simplified scraping."""
+def get_coordinates_from_address(address: str) -> tuple:
+    """Get lat/lng coordinates from address using multiple methods"""
+    try:
+        # Method 1: Try using Nominatim (OpenStreetMap) - more reliable
+        print("🔄 Using Nominatim geocoding service...")
+        try:
+            nominatim_url = f"https://nominatim.openstreetmap.org/search?q={quote_plus(address)}&format=json&limit=1"
+            headers = {'User-Agent': 'Mozilla/5.0 (compatible; PropertyComps/1.0)'}
+
+            response = requests.get(nominatim_url, headers=headers, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                if data:
+                    lat = float(data[0]['lat'])
+                    lng = float(data[0]['lon'])
+                    print(f"✅ Found coordinates via Nominatim: {lat}, {lng}")
+                    return lat, lng
+        except Exception as e:
+            print(f"⚠️ Nominatim geocoding failed: {e}")
+
+        # Method 2: Try Google Geocoding API (if you have an API key)
+        # Uncomment and add your API key if needed
+        # try:
+        #     google_url = f"https://maps.googleapis.com/maps/api/geocode/json?address={quote_plus(address)}&key=YOUR_API_KEY"
+        #     response = requests.get(google_url, timeout=10)
+        #     if response.status_code == 200:
+        #         data = response.json()
+        #         if data['results']:
+        #             location = data['results'][0]['geometry']['location']
+        #             lat = location['lat']
+        #             lng = location['lng']
+        #             print(f"✅ Found coordinates via Google: {lat}, {lng}")
+        #             return lat, lng
+        # except Exception as e:
+        #     print(f"⚠️ Google geocoding failed: {e}")
+
+        print(f"❌ Could not get coordinates for {address}")
+        return None, None
+
+    except Exception as e:
+        print(f"❌ Error getting coordinates: {e}")
+        return None, None
+
+
+def extract_json_from_html(html_content: str) -> dict:
+    try:
+        # Updated patterns for current Redfin structure
+        patterns = [
+            r'window\.__INITIAL_STATE__\s*=\s*({.*?});(?=\s*</script>)',
+            r'window\.__REDUX_STATE__\s*=\s*({.*?});(?=\s*</script>)',
+            r'"searchResults":\s*({[^}]*"homes"[^}]*(?:{[^{}]*}[^}]*)*})',
+            r'"homes":\s*(\[[^\]]*(?:\[[^\[\]]*\][^\]]*)*\])',
+            r'"payload":\s*({[^}]*"homes"[^}]*(?:{[^{}]*}[^}]*)*})',
+            r'"gisData":\s*({[^}]*"homes"[^}]*(?:{[^{}]*}[^}]*)*})'
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, html_content, re.DOTALL)
+            if match:
+                try:
+                    data = json.loads(match.group(1))
+                    if isinstance(data, dict) and ('homes' in data or 'searchResults' in data):
+                        print(f"✅ Found JSON data with pattern: {pattern[:30]}...")
+                        return data
+                except:
+                    continue
+
+        return {}
+    except Exception as e:
+        print(f"⚠️ Error extracting JSON: {e}")
+        return {}
+
+
+def search_redfin_sold_homes_enhanced(lat: float, lng: float, radius_miles: float = 1.0, days_back: int = 365) -> list:
+    """Enhanced search for sold homes using web scraping"""
+    try:
+        # Try to access the sold homes page for the area
+        columbus_region_id = "17151"  # Columbus, OH region ID
+
+        # Multiple URL patterns to try
+        urls_to_try = [
+            f"https://www.redfin.com/city/7158/OH/Columbus/filter/property-type=house,sold-within-days={days_back}",
+            f"https://www.redfin.com/city/7158/OH/Columbus/recently-sold",
+            "https://www.redfin.com/OH/Columbus/recently-sold",
+            f"https://www.redfin.com/zipcode/43224/filter/sold-within-days={days_back}",
+            "https://www.redfin.com/zipcode/43224/recently-sold"
+        ]
+
+        for url in urls_to_try:
+            try:
+                print(f"📡 Trying URL: {url[:60]}...")
+                response = session.get(url, timeout=15)
+
+                if response.status_code == 200:
+                    print(f"✅ Got response, length: {len(response.text)}")
+
+                    # Extract JSON data from the HTML
+                    json_data = extract_json_from_html(response.text)
+
+                    if json_data:
+                        homes = extract_homes_from_json(json_data, lat, lng, radius_miles)
+                        if homes:
+                            print(f"✅ Found {len(homes)} homes from URL")
+                            return homes
+
+                    # Try to parse as CSV if it looks like CSV
+                    if ',' in response.text and 'ADDRESS' in response.text.upper():
+                        homes = parse_csv_response(response.text, lat, lng, radius_miles)
+                        if homes:
+                            return homes
+
+            except Exception as e:
+                print(f"⚠️ URL failed: {e}")
+                continue
+
+        return []
+
+    except Exception as e:
+        print(f"❌ Enhanced search failed: {e}")
+        return []
+
+
+def extract_homes_from_json(json_data: dict, lat: float, lng: float, radius_miles: float) -> list:
+    """Extract home data from various JSON structures"""
+    try:
+        homes = []
+
+        # Try different JSON structures
+        possible_paths = [
+            ['homes'],
+            ['payload', 'homes'],
+            ['searchResults', 'homes'],
+            ['data', 'homes'],
+            ['results', 'homes'],
+            ['payload', 'sections', 0, 'rows'],
+            ['payload', 'exactMatch'],
+            ['homes', 'homes']
+        ]
+
+        possible_paths.extend([
+            ['searchResults', 'properties'],
+            ['gisData', 'homes'],
+            ['mapResults'],
+            ['properties']
+        ])
+        homes_data = None
+        for path in possible_paths:
+            temp_data = json_data
+            try:
+                for key in path:
+                    if isinstance(temp_data, list) and isinstance(key, int):
+                        temp_data = temp_data[key]
+                    elif isinstance(temp_data, dict):
+                        temp_data = temp_data.get(key)
+                    else:
+                        temp_data = None
+                        break
+
+                if temp_data and isinstance(temp_data, list) and len(temp_data) > 0:
+                    homes_data = temp_data
+                    print(f"✅ Found homes data at path: {' -> '.join(map(str, path))}")
+                    break
+            except:
+                continue
+
+        if not homes_data:
+            print("⚠️ No homes data found in JSON structure")
+            return []
+
+        # Process each home
+        for home in homes_data:
+            try:
+                if not isinstance(home, dict):
+                    continue
+
+                # Extract coordinates
+                home_lat = home_lng = None
+
+                if 'latLong' in home:
+                    home_lat = home['latLong'].get('latitude')
+                    home_lng = home['latLong'].get('longitude')
+                elif 'lat' in home and 'lng' in home:
+                    home_lat = home['lat']
+                    home_lng = home['lng']
+                elif 'latitude' in home and 'longitude' in home:
+                    home_lat = home['latitude']
+                    home_lng = home['longitude']
+
+                if not home_lat or not home_lng:
+                    continue
+
+                # Calculate distance
+                distance = geodesic((lat, lng), (home_lat, home_lng)).miles
+
+                if distance <= radius_miles:
+                    homes.append({
+                        'lat': home_lat,
+                        'lng': home_lng,
+                        'distance': distance,
+                        'raw_data': home
+                    })
+
+            except Exception as e:
+                print(f"⚠️ Error processing home: {e}")
+                continue
+
+        print(f"✅ Extracted {len(homes)} homes within {radius_miles} miles")
+        return homes
+
+    except Exception as e:
+        print(f"❌ Error extracting homes from JSON: {e}")
+        return []
+
+
+def is_ad_element(card):
+    """Check if an element is an advertisement"""
+    try:
+        html = card.get_attribute('innerHTML') or ""
+        outer_html = card.get_attribute('outerHTML') or ""
+        class_name = card.get_attribute('class') or ""
+        data_rf_test = card.get_attribute('data-rf-test-name') or ""
+
+        # Check for actual property data
+        has_address = bool(
+            re.search(r'\d+\s+\w+.*(?:st|street|ave|avenue|rd|road|ln|lane|dr|drive|blvd|boulevard|ct|court|pl|place)',
+                      html, re.IGNORECASE))
+        has_price = bool(re.search(r'\$[\d,]+', html))
+        has_beds_baths = bool(re.search(r'\d+\s*(?:bed|bath)', html, re.IGNORECASE))
+
+        # If it has property characteristics, it's likely real
+        if has_address and (has_price or has_beds_baths):
+            return False
+
+        ad_indicators = [
+            'DisplayAd', 'DisplayAdWrapper', 'InlineResultStaticPlacement',
+            'data-googl', 'googleads', 'advertisement', 'sponsored',
+            'adContainer', 'AdCard', 'ad-unit'
+        ]
+
+        combined_text = f"{html} {outer_html} {class_name} {data_rf_test}".lower()
+        return any(indicator.lower() in combined_text for indicator in ad_indicators)
+    except:
+        return True
+
+
+def search_redfin_sold_homes_selenium_enhanced(address: str, radius_miles: float = 1.0, days_back: int = 365) -> list:
+    """Enhanced Selenium scraping with better selectors and error handling"""
+    driver = None
     try:
         options = Options()
         options.add_argument("--headless")
@@ -71,89 +318,874 @@ def get_redfin_comps(address: str,
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-logging")
         options.add_argument("--log-level=3")
-        options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option('useAutomationExtension', False)
+        options.add_argument(
+            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
-        print("🌐 Starting browser...")
+        print("🌐 Starting enhanced browser scraping...")
         driver = webdriver.Chrome(options=options)
+        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
-        # Try a simple Redfin search
-        search_query = address.replace(",", "").replace(" ", "+")
-        url = f"https://www.redfin.com/stingray/do/query-location?location={search_query}"
+        # Start with Columbus sold homes page
+        base_url = "https://www.redfin.com/city/7158/OH/Columbus/filter/property-type=house,include=sold-1yr,no-hoa=false"
+        print(f"🔍 Starting with: {base_url}")
 
-        driver.get(url)
-        time.sleep(2)
+        driver.get(base_url)
+        time.sleep(5)
 
-        # Get page source and look for any data
-        page_source = driver.page_source
-        print(f"📄 Page loaded, content length: {len(page_source)}")
+        try:
+            # Wait for the page to load and ads to be filtered out
+            WebDriverWait(driver, 15).until(
+                lambda driver: len([card for card in driver.find_elements(By.CSS_SELECTOR,
+                                                                          ".HomeCard, [data-rf-test-name='MapHomeCard']")
+                                    if not is_ad_element(card)]) > 0
+            )
+            print("✅ Real property cards loaded")
+        except:
+            print("⚠️ Timeout waiting for real property cards (not ads)")
 
-        driver.quit()
+        # Try to extract property data
+        property_selectors = [
+            "[data-rf-test-name*='HomeCard'], [data-rf-test-name*='home-card']",
+            ".HomeCard, .SearchResultCard",
+            "[data-rf-test-name*='listing'], [data-rf-test-name*='property']",
+            ".listingCard, .propertyCard",
+            ".search-result-item, .result-item",
+            "[class*='Card'][class*='home' i], [class*='Card'][class*='listing' i]",
+            "div[class*='result' i]:has(a[href*='/home/'])",
+            "article, .property, .listing"
+        ]
 
-        # For now, return sample data since scraping is complex
-        return get_redfin_comps_simple(address)
+        property_cards = []
+        for selector in property_selectors:
+            try:
+                cards = driver.find_elements(By.CSS_SELECTOR, selector)
+                if cards:
+                    # Filter out advertisement elements
+                    filtered_cards = [card for card in cards if not is_ad_element(card)]
+                    if filtered_cards:
+                        property_cards = filtered_cards
+                        print(
+                            f"✅ Found {len(filtered_cards)} real property cards (filtered from {len(cards)} total) with selector: {selector}")
+                        # Debug first few cards
+                        for i, card in enumerate(filtered_cards[:3]):
+                            try:
+                                card_html = card.get_attribute('innerHTML')
+                                print(f"🔍 Real Card {i + 1} HTML preview: {card_html[:200]}...")
+                            except:
+                                pass
+                        break
+                    else:
+                        print(f"⚠️ Found {len(cards)} cards but all were ads with selector: {selector}")
+            except:
+                continue
+
+        if not property_cards:
+            # Try extracting from page source
+            print("🔍 No cards found, trying page source extraction...")
+            page_source = driver.page_source
+
+            # Look for JSON data in page source
+            json_data = extract_json_from_html(page_source)
+            if json_data and 'homes' in json_data:
+                print("✅ Found JSON data in page source")
+                # Convert to our format
+                homes = []
+                for home in json_data['homes']:
+                    try:
+                        homes.append({
+                            'address': home.get('streetLine', {}).get('value', '') or home.get('address', ''),
+                            'price': home.get('price', {}).get('value', 0) if isinstance(home.get('price'),
+                                                                                         dict) else home.get('price',
+                                                                                                             0),
+                            'sqft': home.get('sqFt', {}).get('value', 0) if isinstance(home.get('sqFt'),
+                                                                                       dict) else home.get('sqFt', 0),
+                            'beds': home.get('beds', 0),
+                            'baths': home.get('baths', 0),
+                            'distance': 0,  # We don't have coordinates to calculate
+                            'details': home
+                        })
+                    except:
+                        continue
+
+                if homes:
+                    print(f"✅ Extracted {len(homes)} properties from JSON")
+                    return homes[:20]  # Limit results
+
+            return []
+
+        # Process property cards
+        sold_homes = []
+        for i, card in enumerate(property_cards[:30]):  # Limit to 30 results
+            try:
+                # Debug the card content
+                card_html = card.get_attribute('innerHTML')[:500] if card.get_attribute('innerHTML') else "No innerHTML"
+                print(f"🔍 Card {i + 1} HTML preview: {card_html}")
+
+                home_data = extract_data_from_card(card)
+                if home_data:
+                    sold_homes.append(home_data)
+                    print(f"✅ Property {i + 1}: {home_data['address'][:40]}... - ${home_data.get('price', 'N/A')}")
+                else:
+                    print(f"⚠️ No data extracted from card {i + 1}")
+
+            except Exception as e:
+                print(f"❌ Error extracting card {i + 1}: {e}")
+                continue
+
+        print(f"✅ Found {len(sold_homes)} properties via enhanced Selenium")
+        return sold_homes
 
     except Exception as e:
-        print(f"❌ Browser error: {e}")
-        return get_redfin_comps_simple(address)
+        print(f"❌ Enhanced Selenium scraping failed: {e}")
+        return []
+    finally:
+        if driver:
+            driver.quit()
 
 
-def get_redfin_comps_simple(address: str) -> list[dict]:
-    """Generate realistic sample comp data based on Columbus, OH market"""
-    print("🔄 Generating sample comparable sales data...")
+def extract_data_from_card(card) -> dict:
+    try:
+        home_data = {}
 
-    # Generate realistic comps for Columbus area
-    base_price = 250000
-    comps = []
+        # Get all text content for debugging
+        all_text = card.text
+        print(f"🔍 Card text content: {all_text[:200]}...")
 
-    sample_addresses = [
-        "2501 Hingham Ln, Columbus, OH 43224",
-        "2487 Hingham Ln, Columbus, OH 43224",
-        "1234 Northbrook Dr, Columbus, OH 43224",
-        "5678 Autumn Ridge Dr, Columbus, OH 43224",
-        "9012 Maple Grove Ave, Columbus, OH 43224"
-    ]
+        # Updated selectors for current Redfin structure
+        try:
+            # Address - try multiple selectors
+            address_selectors = [
+                "[data-rf-test-name*='address']",
+                ".streetLine, .street-line",
+                ".address .bp-Heading, .address h1, .address h2, .address h3",
+                ".homeAddress, .home-address",
+                ".full-address, .listing-address",
+                "a[href*='/home/']"  # Links to property pages often contain addresses
+            ]
 
-    # Use current year (2025) and recent dates
-    current_date = datetime.date.today()
+            for selector in address_selectors:
+                try:
+                    addr_elem = card.find_element(By.CSS_SELECTOR, selector)
+                    addr_text = addr_elem.text.strip()
+                    if addr_text and len(addr_text) > 5:  # Basic validation
+                        home_data['address'] = addr_text
+                        break
+                except:
+                    continue
 
-    for i, addr in enumerate(sample_addresses):
-        price = base_price + (i * 15000) + ((-1) ** i * 10000)  # Vary prices
-        sqft = 1400 + (i * 100)
+            # If no address found, try extracting from text using regex
+            if not home_data.get('address'):
+                address_match = re.search(r'\d+\s+[\w\s]+(?:St|Street|Ave|Avenue|Rd|Road|Ln|Lane|Dr|Drive|Blvd|Boulevard|Ct|Court|Pl|Place)', all_text, re.IGNORECASE)
+                if address_match:
+                    home_data['address'] = address_match.group()
 
-        # Create dates within the last 6 months
-        days_ago = 30 + (i * 30)  # 30, 60, 90, 120, 150 days ago
-        sale_date = current_date - datetime.timedelta(days=days_ago)
+            # Price - enhanced extraction
+            price_selectors = [
+                "[data-rf-test-name*='price']",
+                ".statsValue, .stats-value",
+                ".price .bp-Heading, .price h1, .price h2, .price h3",
+                ".homeprice, .home-price",
+                ".sold-price, .list-price"
+            ]
 
-        comps.append({
-            "address": addr,
-            "soldDate": sale_date.strftime("%Y-%m-%d"),
+            for selector in price_selectors:
+                try:
+                    price_elem = card.find_element(By.CSS_SELECTOR, selector)
+                    price_text = price_elem.text.strip()
+                    price_match = re.search(r'\$?([\d,]+)', price_text)
+                    if price_match:
+                        home_data['price'] = price_match.group(1).replace(',', '')
+                        break
+                except:
+                    continue
+
+            # If no price found, try extracting from all text
+            if not home_data.get('price'):
+                price_match = re.search(r'\$?([\d,]+)', all_text)
+                if price_match:
+                    price_str = price_match.group(1).replace(',', '')
+                    if len(price_str) >= 5:  # Likely a house price
+                        home_data['price'] = price_str
+
+            # Extract beds, baths, sqft from text
+            beds_match = re.search(r'(\d+)\s*(?:bed|bd)', all_text, re.IGNORECASE)
+            if beds_match:
+                home_data['beds'] = int(beds_match.group(1))
+
+            baths_match = re.search(r'(\d+(?:\.\d+)?)\s*(?:bath|ba)', all_text, re.IGNORECASE)
+            if baths_match:
+                home_data['baths'] = float(baths_match.group(1))
+
+            sqft_match = re.search(r'([\d,]+)\s*(?:sq\s*ft|sqft)', all_text, re.IGNORECASE)
+            if sqft_match:
+                home_data['sqft'] = int(sqft_match.group(1).replace(',', ''))
+
+        except Exception as e:
+            print(f"⚠️ Error in card extraction: {e}")
+
+        return home_data if home_data.get('address') or home_data.get('price') else None
+
+    except Exception as e:
+        print(f"❌ Error extracting card data: {e}")
+        return None
+
+
+def parse_csv_response(csv_text: str, lat: float, lng: float, radius_miles: float) -> list:
+    """Enhanced CSV parsing with better error handling"""
+    try:
+        # Add this check at the beginning
+        if not csv_text or len(csv_text.strip()) < 100:
+            print("⚠️ CSV response too short or empty")
+            return []
+
+        # Check if it's actually HTML instead of CSV
+        if '<html' in csv_text.lower() or '<body' in csv_text.lower():
+            print("⚠️ Response appears to be HTML, not CSV")
+            return []
+        lines = csv_text.strip().split('\n')
+        if len(lines) < 2:
+            return []
+
+        # Find the header line
+        header_line = None
+        for i, line in enumerate(lines):
+            if 'ADDRESS' in line.upper() or 'PRICE' in line.upper():
+                header_line = i
+                break
+
+        if header_line is None:
+            print("⚠️ No valid CSV header found")
+            return []
+
+        # Use the CSV data starting from the header
+        csv_data = '\n'.join(lines[header_line:])
+        csv_reader = csv.DictReader(StringIO(csv_data))
+        sold_homes = []
+
+        for row in csv_reader:
+            try:
+                # Try different column name variations
+                lat_cols = ['LATITUDE', 'LAT', 'Latitude', 'lat']
+                lng_cols = ['LONGITUDE', 'LNG', 'LON', 'Longitude', 'lng', 'lon']
+
+                home_lat = home_lng = None
+
+                for col in lat_cols:
+                    if col in row and row[col]:
+                        home_lat = float(row[col])
+                        break
+
+                for col in lng_cols:
+                    if col in row and row[col]:
+                        home_lng = float(row[col])
+                        break
+
+                if home_lat and home_lng:
+                    distance = geodesic((lat, lng), (home_lat, home_lng)).miles
+
+                    if distance <= radius_miles:
+                        sold_homes.append({
+                            'lat': home_lat,
+                            'lng': home_lng,
+                            'distance': distance,
+                            'raw_data': row
+                        })
+
+            except Exception as e:
+                continue  # Skip malformed rows
+
+        print(f"✅ Parsed {len(sold_homes)} homes from enhanced CSV")
+        return sold_homes
+
+    except Exception as e:
+        print(f"❌ Error parsing enhanced CSV: {e}")
+        return []
+
+
+def get_redfin_comps_enhanced(address: str,
+                              radius_miles: float = 1,
+                              sold_within_days: int = 365,
+                              max_rows: int = 200) -> list[dict]:
+    """Enhanced version of get_redfin_comps with better error handling and multiple strategies"""
+    try:
+        print(f"🔍 Getting coordinates for: {address}")
+        lat, lng = get_coordinates_from_address(address)
+
+        if not lat or not lng:
+            print("❌ Could not get coordinates for address")
+            print("🔄 Trying Selenium fallback without coordinates...")
+            selenium_results = search_redfin_sold_homes_selenium_enhanced(address, radius_miles, sold_within_days)
+            if selenium_results:
+                comps = []
+                for result in selenium_results:
+                    try:
+                        price_str = str(result.get('price', '0')).replace('$', '').replace(',', '').replace('Sold',
+                                                                                                            '').strip()
+                        price = int(''.join(filter(str.isdigit, price_str))) if price_str else 0
+
+                        comp = {
+                            "address": result.get('address', ''),
+                            "soldDate": datetime.now().strftime('%Y-%m-%d'),
+                            "price": price,
+                            "sqft": result.get('sqft', 0),
+                            "ppsq": round(price / result.get('sqft', 1)) if result.get('sqft', 0) > 0 else 0,
+                            "beds": result.get('beds', 0),
+                            "baths": result.get('baths', 0),
+                            "lot": 0,
+                            "dist": result.get('distance', 0),
+                            "url": "",
+                            "img": None
+                        }
+                        comps.append(comp)
+                    except:
+                        continue
+
+                print(f"✅ Selenium fallback found {len(comps)} properties")
+                return comps[:max_rows]
+            else:
+                return []
+
+        print(f"📍 Coordinates: {lat}, {lng}")
+
+        # Try enhanced search method first
+        print(f"🏠 Searching for sold homes within {radius_miles} miles using enhanced method...")
+        sold_homes = search_redfin_sold_homes_enhanced(lat, lng, radius_miles, sold_within_days)
+
+        # If enhanced method fails, try Selenium
+        if not sold_homes:
+            print("🔄 Enhanced method failed, trying Selenium fallback...")
+            selenium_results = search_redfin_sold_homes_selenium_enhanced(address, radius_miles, sold_within_days)
+            if selenium_results:
+                return selenium_results[:max_rows]
+
+        if not sold_homes:
+            print("❌ No sold homes found")
+            return []
+
+        # Parse and format the data
+        comps = []
+        for home in sold_homes[:max_rows]:
+            parsed = parse_redfin_home_data(home['raw_data'], home['distance'])
+            if parsed:
+                comps.append(parsed)
+
+        print(f"✅ Successfully parsed {len(comps)} comparable sales")
+        return comps
+
+    except Exception as e:
+        print(f"❌ Error in enhanced get_redfin_comps: {e}")
+        return []
+
+
+def parse_redfin_home_data(raw_data: dict, distance: float) -> dict:
+    """Enhanced parsing with better field extraction"""
+    try:
+        # Handle both CSV and JSON formats
+        if isinstance(raw_data, dict):
+            # CSV format
+            if 'ADDRESS' in raw_data:
+                address = raw_data.get('ADDRESS', '').strip('"')
+                price_str = raw_data.get('PRICE', '0').replace('$', '').replace(',', '')
+                price = int(price_str) if price_str.isdigit() else 0
+
+                sqft_str = raw_data.get('SQUARE FEET', '0').replace(',', '')
+                sqft = int(sqft_str) if sqft_str.isdigit() else 0
+
+                beds_str = raw_data.get('BEDS', '0')
+                beds = int(beds_str) if beds_str.isdigit() else 0
+
+                baths_str = raw_data.get('BATHS', '0')
+                baths = float(baths_str) if baths_str.replace('.', '').isdigit() else 0
+
+                sold_date_str = raw_data.get('SOLD DATE', '')
+                sold_date = None
+                if sold_date_str:
+                    try:
+                        sold_date = datetime.strptime(sold_date_str.strip('"'), '%m/%d/%Y').strftime('%Y-%m-%d')
+                    except:
+                        sold_date = datetime.now().strftime('%Y-%m-%d')
+
+                url = raw_data.get('URL', '').strip('"')
+                if url and not url.startswith('http'):
+                    url = f"https://www.redfin.com{url}"
+
+            # JSON format - enhanced field extraction
+            else:
+                # Try multiple possible field names
+                address_fields = ['streetLine', 'address', 'fullAddress', 'street']
+                address = ''
+                for field in address_fields:
+                    if field in raw_data:
+                        if isinstance(raw_data[field], dict):
+                            address = raw_data[field].get('value', '')
+                        else:
+                            address = str(raw_data[field])
+                        if address:
+                            break
+
+                # Price extraction
+                price_fields = ['price', 'soldPrice', 'listPrice']
+                price = 0
+                for field in price_fields:
+                    if field in raw_data:
+                        if isinstance(raw_data[field], dict):
+                            price = raw_data[field].get('value', 0)
+                        else:
+                            price = raw_data[field]
+                        if price:
+                            break
+
+                # Square footage
+                sqft_fields = ['sqFt', 'squareFeet', 'livingArea']
+                sqft = 0
+                for field in sqft_fields:
+                    if field in raw_data:
+                        if isinstance(raw_data[field], dict):
+                            sqft = raw_data[field].get('value', 0)
+                        else:
+                            sqft = raw_data[field]
+                        if sqft:
+                            break
+
+                beds = raw_data.get('beds', 0)
+                baths = raw_data.get('baths', 0)
+
+                # Handle sold date
+                sold_date = datetime.now().strftime('%Y-%m-%d')
+                if 'soldDate' in raw_data:
+                    try:
+                        if isinstance(raw_data['soldDate'], (int, float)):
+                            sold_date = datetime.fromtimestamp(raw_data['soldDate'] / 1000).strftime('%Y-%m-%d')
+                        else:
+                            sold_date = str(raw_data['soldDate'])[:10]
+                    except:
+                        pass
+
+                url = raw_data.get('url', '')
+                if url and not url.startswith('http'):
+                    url = f"https://www.redfin.com{url}"
+
+        # Calculate derived values
+        ppsq = round(price / sqft) if sqft > 0 else 0
+
+        return {
+            "address": address,
+            "soldDate": sold_date or datetime.now().strftime('%Y-%m-%d'),
             "price": price,
             "sqft": sqft,
-            "ppsq": round(price / sqft),
-            "beds": 3 + (i % 2),
-            "baths": 2 + (i % 2),
-            "lot": round(0.15 + (i * 0.05), 2),
-            "dist": round(0.1 + (i * 0.15), 2),
-            "url": f"https://www.redfin.com/sample-{i + 1}",
+            "ppsq": ppsq,
+            "beds": beds,
+            "baths": baths,
+            "lot": 0,  # Not easily available
+            "dist": round(distance, 2),
+            "url": url,
             "img": None
-        })
+        }
 
-    print(f"✅ Generated {len(comps)} sample comparables")
-    return comps
+    except Exception as e:
+        print(f"⚠️ Error parsing enhanced home data: {e}")
+        return None
+
+
+# Replace the original functions with enhanced versions
+def get_redfin_comps(address: str, radius_miles: float = 1, sold_within_days: int = 365, max_rows: int = 200) -> list[
+    dict]:
+    return get_redfin_comps_enhanced(address, radius_miles, sold_within_days, max_rows)
+
+def search_redfin_sold_homes_api(lat: float, lng: float, radius_miles: float = 1.0, days_back: int = 365) -> list:
+    """Search for sold homes using Redfin's API endpoints"""
+    try:
+        # Try different API endpoints that might work
+        endpoints = [
+            f"https://www.redfin.com/stingray/api/gis-csv?al=1&market=columbus&min_stories=1&num_homes=350&ord=redfin-recommended-asc&page_number=1&region_id=17151&region_type=6&sold_within_days={days_back}&status=9&uipt=1,2,3,4,5,6,7,8&v=8",
+            f"https://www.redfin.com/stingray/api/gis?al=1&region_id=17151&region_type=6&sold_within_days={days_back}&status=9&uipt=1,2,3,4,5,6,7,8&v=8",
+            f"https://www.redfin.com/stingray/api/home/details/belowTheFold?propertyId=1&accessLevel=1"
+        ]
+
+        for endpoint in endpoints:
+            try:
+                response = session.get(endpoint, timeout=15)
+                print(f"📡 Trying endpoint: {endpoint[:50]}... Status: {response.status_code}")
+
+                if response.status_code == 200 and response.text:
+                    # Try to parse as CSV first
+                    if 'csv' in endpoint.lower() or ',' in response.text:
+                        result = parse_csv_response(response.text, lat, lng, radius_miles)
+                        if result:
+                            return result
+                    # Try to parse as JSON
+                    elif response.text.startswith('{') or response.text.startswith('{}&&'):
+                        result = parse_json_response(response.text, lat, lng, radius_miles)
+                        if result:
+                            return result
+
+            except Exception as e:
+                print(f"⚠️ Endpoint failed: {e}")
+                continue
+
+        # If API calls fail, try the simple requests approach
+        return search_redfin_simple_requests("", days_back)
+
+    except Exception as e:
+        print(f"❌ Error searching sold homes via API: {e}")
+        return []
+
+
+def parse_json_response(json_text: str, lat: float, lng: float, radius_miles: float) -> list:
+    """Parse JSON response from Redfin API"""
+    try:
+        # Handle JSONP format
+        if json_text.startswith('{}&&'):
+            json_text = json_text[4:]
+
+        data = json.loads(json_text)
+        sold_homes = []
+
+        # Navigate through different possible JSON structures
+        homes_data = None
+        if 'payload' in data:
+            if 'homes' in data['payload']:
+                homes_data = data['payload']['homes']
+            elif 'sections' in data['payload']:
+                for section in data['payload']['sections']:
+                    if 'rows' in section:
+                        homes_data = section['rows']
+                        break
+
+        if homes_data:
+            for home in homes_data:
+                try:
+                    if 'latLong' in home:
+                        home_lat = home['latLong']['latitude']
+                        home_lng = home['latLong']['longitude']
+
+                        distance = geodesic((lat, lng), (home_lat, home_lng)).miles
+
+                        if distance <= radius_miles:
+                            sold_homes.append({
+                                'lat': home_lat,
+                                'lng': home_lng,
+                                'distance': distance,
+                                'raw_data': home
+                            })
+
+                except Exception as e:
+                    continue
+
+        print(f"✅ Parsed {len(sold_homes)} homes from JSON")
+        return sold_homes
+
+    except Exception as e:
+        print(f"❌ Error parsing JSON: {e}")
+        return []
+
+
+def search_redfin_simple_requests(address: str, days_back: int = 365) -> list:
+    """Simple requests-based approach to find sold homes"""
+    try:
+        print("🔍 Trying simple requests approach...")
+
+        # Clean up the address for URL
+        clean_address = address.replace(",", "").replace(" ", "-").lower()
+
+        # Try different URL patterns that Redfin might use
+        urls_to_try = [
+            f"https://www.redfin.com/city/7158/OH/Columbus/filter/include=sold-1yr,property-type=house",
+            f"https://www.redfin.com/zipcode/43224/filter/include=sold-1yr",
+            "https://www.redfin.com/stingray/api/gis?al=1&region_id=17151&region_type=6&sold_within_days=365&status=9&uipt=1,2,3,4,5,6,7,8",
+            f"https://www.redfin.com/city/7158/OH/Columbus/recently-sold"
+        ]
+
+        for url in urls_to_try:
+            try:
+                print(f"📡 Trying: {url[:60]}...")
+                response = session.get(url, timeout=15)
+
+                if response.status_code == 200:
+                    content = response.text
+                    print(f"✅ Got response, length: {len(content)}")
+
+                    # Look for JSON data in the response
+                    if content.startswith('{}&&'):
+                        json_content = content[4:]
+                    else:
+                        json_content = content
+
+                    # Try to find property data
+                    if '"homes"' in content or '"properties"' in content or '"listings"' in content:
+                        print("✅ Found property data in response")
+                        # This would need parsing - for now just return empty
+                        return []
+
+                    # Look for CSV-like data
+                    if 'ADDRESS' in content and 'PRICE' in content:
+                        print("✅ Found CSV-like data")
+                        return parse_csv_response(content, 0, 0, 10)  # Large radius since no coords
+
+            except Exception as e:
+                print(f"⚠️ URL failed: {e}")
+                continue
+
+        return []
+
+    except Exception as e:
+        print(f"❌ Simple requests failed: {e}")
+        return []
+
+
+def search_redfin_sold_homes_selenium(address: str, radius_miles: float = 1.0, days_back: int = 365) -> list:
+    """Fallback method using Selenium to scrape Redfin sold homes"""
+    try:
+        options = Options()
+        options.add_argument("--headless")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-logging")
+        options.add_argument("--log-level=3")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option('useAutomationExtension', False)
+        options.add_argument(
+            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+        print("🌐 Starting browser for Selenium scraping...")
+        driver = webdriver.Chrome(options=options)
+
+        # Execute script to remove webdriver property
+        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+        try:
+            # Try direct URL approach first
+            search_query = address.replace(",", "").replace(" ", "-").lower()
+            direct_url = f"https://www.redfin.com/{search_query}/recently-sold"
+
+            print(f"🔍 Trying direct URL: {direct_url}")
+            driver.get(direct_url)
+            time.sleep(3)
+
+            # If direct URL doesn't work, try the search approach
+            if "page-not-found" in driver.current_url.lower() or "error" in driver.page_source.lower():
+                print("🔄 Direct URL failed, trying search approach...")
+
+                # Go to main Redfin page
+                driver.get("https://www.redfin.com")
+                time.sleep(2)
+
+                # Try different search input selectors
+                search_selectors = [
+                    "input[data-rf-test-name='search-box-input']",
+                    "input[placeholder*='Enter an address']",
+                    "input[type='text'][name='location']",
+                    "input.search-input-box",
+                    "#search-box-input",
+                    ".search-input input"
+                ]
+
+                search_box = None
+                for selector in search_selectors:
+                    try:
+                        search_box = WebDriverWait(driver, 3).until(
+                            EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+                        )
+                        print(f"✅ Found search box with selector: {selector}")
+                        break
+                    except:
+                        continue
+
+                if not search_box:
+                    print("❌ Could not find search box")
+                    return []
+
+                # Enter the address
+                search_box.clear()
+                search_box.send_keys(address)
+                time.sleep(1)
+
+                # Try different search button selectors
+                search_button_selectors = [
+                    "button[data-rf-test-name='search-button']",
+                    "button[type='submit']",
+                    ".search-button",
+                    ".submit-button",
+                    "button[aria-label*='Search']"
+                ]
+
+                search_button = None
+                for selector in search_button_selectors:
+                    try:
+                        search_button = driver.find_element(By.CSS_SELECTOR, selector)
+                        search_button.click()
+                        print(f"✅ Clicked search button with selector: {selector}")
+                        break
+                    except:
+                        continue
+
+                if not search_button:
+                    # Try pressing Enter instead
+                    from selenium.webdriver.common.keys import Keys
+                    search_box.send_keys(Keys.RETURN)
+                    print("✅ Pressed Enter to search")
+
+                time.sleep(3)
+
+            # Look for sold homes filter or navigate to sold homes
+            try:
+                # Try to find and click "Sold" filter
+                sold_selectors = [
+                    "//span[contains(text(), 'Sold')]",
+                    "//button[contains(text(), 'Sold')]",
+                    "//a[contains(text(), 'Sold')]",
+                    "[data-rf-test-name='sold-filter']",
+                    ".sold-filter"
+                ]
+
+                for selector in sold_selectors:
+                    try:
+                        if selector.startswith("//"):
+                            element = driver.find_element(By.XPATH, selector)
+                        else:
+                            element = driver.find_element(By.CSS_SELECTOR, selector)
+                        element.click()
+                        print(f"✅ Clicked sold filter with selector: {selector}")
+                        time.sleep(2)
+                        break
+                    except:
+                        continue
+
+            except Exception as e:
+                print(f"⚠️ Could not find 'Sold' filter: {e}")
+
+            # Try to extract any property data from the page
+            print("🔍 Looking for property data...")
+
+            # Multiple selectors for property cards
+            card_selectors = [
+                "[data-rf-test-name='MapHomeCard']",
+                ".HomeCard",
+                ".SearchResultCard",
+                ".listingCard",
+                ".home-card",
+                ".property-card"
+            ]
+
+            property_cards = []
+            for selector in card_selectors:
+                try:
+                    cards = driver.find_elements(By.CSS_SELECTOR, selector)
+                    if cards:
+                        property_cards = cards
+                        print(f"✅ Found {len(cards)} cards with selector: {selector}")
+                        break
+                except:
+                    continue
+
+            if not property_cards:
+                # Try looking in the page source for JSON data
+                print("🔍 Looking for JSON data in page source...")
+                page_source = driver.page_source
+
+                # Look for common patterns in Redfin's data
+                import re
+                json_patterns = [
+                    r'"homes":\s*\[(.*?)\]',
+                    r'"searchResults":\s*\[(.*?)\]',
+                    r'"listings":\s*\[(.*?)\]'
+                ]
+
+                for pattern in json_patterns:
+                    matches = re.search(pattern, page_source, re.DOTALL)
+                    if matches:
+                        print("✅ Found JSON data in page source")
+                        # This would need more complex parsing
+                        break
+
+                print(f"📄 Page title: {driver.title}")
+                print(f"📄 Current URL: {driver.current_url}")
+                print(f"📄 Page source length: {len(page_source)}")
+
+                return []
+
+            sold_homes = []
+            for i, card in enumerate(property_cards[:20]):  # Limit to first 20 results
+                try:
+                    # Try multiple selectors for address
+                    address_selectors = [
+                        ".address",
+                        "[data-rf-test-name='full-address']",
+                        ".home-address",
+                        ".listing-address",
+                        ".property-address"
+                    ]
+
+                    home_address = ""
+                    for addr_sel in address_selectors:
+                        try:
+                            addr_elem = card.find_element(By.CSS_SELECTOR, addr_sel)
+                            home_address = addr_elem.text.strip()
+                            break
+                        except:
+                            continue
+
+                    # Try multiple selectors for price
+                    price_selectors = [
+                        ".price",
+                        "[data-rf-test-name='price']",
+                        ".listing-price",
+                        ".home-price",
+                        ".sold-price"
+                    ]
+
+                    home_price = ""
+                    for price_sel in price_selectors:
+                        try:
+                            price_elem = card.find_element(By.CSS_SELECTOR, price_sel)
+                            home_price = price_elem.text.strip()
+                            break
+                        except:
+                            continue
+
+                    if home_address or home_price:
+                        sold_homes.append({
+                            'address': home_address or f"Property {i + 1}",
+                            'price': home_price or "Price not found",
+                            'details': {},
+                            'distance': 0
+                        })
+                        print(f"   Found: {home_address[:50]}... - {home_price}")
+
+                except Exception as e:
+                    print(f"⚠️ Error extracting card {i + 1}: {e}")
+                    continue
+
+            print(f"✅ Found {len(sold_homes)} properties via Selenium")
+            return sold_homes
+
+        finally:
+            driver.quit()
+
+    except Exception as e:
+        print(f"❌ Selenium scraping failed: {e}")
+        return []
 
 
 def _bucket(comps, r_min, r_max, d_min, d_max):
+    """Filter comps by distance and date ranges"""
     filtered = []
     for c in comps:
-        days_old = (datetime.date.today() - datetime.date.fromisoformat(c["soldDate"][:10])).days
-        distance = c["dist"]
+        try:
+            days_old = (date.today() - date.fromisoformat(c["soldDate"][:10])).days
+            distance = c["dist"]
 
-        # Debug each comp
-        in_distance_range = r_min < distance <= r_max
-        in_date_range = d_min <= days_old < d_max
+            in_distance_range = r_min < distance <= r_max
+            in_date_range = d_min <= days_old < d_max
 
-        if in_distance_range and in_date_range:
-            filtered.append(c)
+            if in_distance_range and in_date_range:
+                filtered.append(c)
+        except:
+            continue
 
     return filtered
 
@@ -161,27 +1193,29 @@ def _bucket(comps, r_min, r_max, d_min, d_max):
 def log_comp_buckets(address: str, comps: list[dict]):
     """Pretty-print the four requested buckets to stdout."""
     buckets = [
-        ("🔹 ≤0.5 mi & ≤6 mo",      _bucket(comps, 0, 0.5,   0, 181)),
-        ("🔹 ≤0.5 mi & 6-12 mo",    _bucket(comps, 0, 0.5, 181, 366)),
-        ("🔸 0.5-1 mi & ≤6 mo",     _bucket(comps, 0.5, 1,   0, 181)),
-        ("🔸 0.5-1 mi & 6-12 mo",   _bucket(comps, 0.5, 1, 181, 366)),
+        ("🔹 ≤0.5 mi & ≤6 mo", _bucket(comps, 0, 0.5, 0, 181)),
+        ("🔹 ≤0.5 mi & 6-12 mo", _bucket(comps, 0, 0.5, 181, 366)),
+        ("🔸 0.5-1 mi & ≤6 mo", _bucket(comps, 0.5, 1, 0, 181)),
+        ("🔸 0.5-1 mi & 6-12 mo", _bucket(comps, 0.5, 1, 181, 366)),
     ]
 
     print(f"🔍 Total comps available: {len(comps)}")
     for i, comp in enumerate(comps):
-        days_old = (datetime.date.today() - datetime.date.fromisoformat(comp["soldDate"][:10])).days
-        print(f"   Comp {i+1}: {comp['address'][:30]}... | {comp['dist']:.2f}mi | {days_old} days old")
+        try:
+            days_old = (date.today() - date.fromisoformat(comp["soldDate"][:10])).days
+            print(f"   Comp {i + 1}: {comp['address'][:30]}... | {comp['dist']:.2f}mi | {days_old} days old")
+        except:
+            print(f"   Comp {i + 1}: {comp['address'][:30]}... | {comp['dist']:.2f}mi | date parsing error")
 
-    # ADD THIS DEBUG FOR BUCKETS:
     print(f"\n🔍 Bucket results:")
     print(f"   Bucket 1 (≤0.5mi, ≤6mo): {len(buckets[0][1])} items")
     print(f"   Bucket 2 (≤0.5mi, 6-12mo): {len(buckets[1][1])} items")
     print(f"   Bucket 3 (0.5-1mi, ≤6mo): {len(buckets[2][1])} items")
     print(f"   Bucket 4 (0.5-1mi, 6-12mo): {len(buckets[3][1])} items")
 
-    print("\n" + "═"*65)
+    print("\n" + "═" * 65)
     print(f"🏠  COMPARABLE SALES AROUND: {address.upper()}")
-    print("═"*65)
+    print("═" * 65)
 
     for title, rows in buckets:
         if not rows:
@@ -198,7 +1232,7 @@ def log_comp_buckets(address: str, comps: list[dict]):
                   f"{c['sqft']:,} sf | "
                   f"{c['url']} | "
                   f"{c['img'] or 'no-img'}")
-    print("\n📋  End of comps\n" + "═"*65 + "\n")
+    print("\n📋  End of comps\n" + "═" * 65 + "\n")
 
 
 def search_redfin_url(address):
@@ -1353,20 +2387,15 @@ def autofill_column(file_path, col_letter):
     print("✅ Finished copying values and formatting from column B.")
 
     try:
-        print("🔍 Attempting to fetch comparables...")
+        print("🔍 Attempting to fetch real comparables...")
         comps = get_redfin_comps(address, radius_miles=1, sold_within_days=365)
 
-        # If no comps found, use simple fallback
         if not comps:
-            print("⚠️ No comps found, using fallback data...")
-            comps = get_redfin_comps_simple(address)
-
-        log_comp_buckets(address, comps)
+            print("❌ No real comps found")
+        else:
+            log_comp_buckets(address, comps)
     except Exception as e:
-        print(f"⚠️ Comp fetch failed: {e}")
-        # Use fallback data
-        comps = get_redfin_comps_simple(address)
-        log_comp_buckets(address, comps)
+        print(f"❌ Comp fetch failed: {e}")
 
     try:
         wb.save(file_path)
@@ -1386,3 +2415,4 @@ if __name__ == "__main__":
 
     autofill_column(file_path, col_letter)
     print("🏁 Done.")
+
